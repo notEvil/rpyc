@@ -44,14 +44,14 @@ class AsyncResult(object):
         """Waits for the result to arrive. If the AsyncResult object has an
         expiry set, and the result did not arrive within that timeout,
         an :class:`AsyncResultTimeout` exception is raised"""
-        while not (self._is_ready or self._ttl.expired()):
-            self._conn._recvlock.acquire()
-            if self._is_ready or self._ttl.expired():
-                self._conn._recvlock.release()
-                break
-            self._conn.serve(self._ttl, lock_extended=True)
-        if not self._is_ready:
-            raise AsyncResultTimeout("result expired")
+        if self._is_ready:
+            return
+        while True:
+            self._conn.serve(self._ttl)
+            if self._is_ready:
+                return
+            if self._ttl.expired():
+                raise AsyncResultTimeout("result expired")
 
     def add_callback(self, func):
         """Adds a callback to be invoked when the result arrives. The callback

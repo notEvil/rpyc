@@ -5,9 +5,13 @@ import itertools
 import socket
 import time  # noqa: F401
 import gc  # noqa: F401
-import struct
 
-from threading import Lock, Condition, RLock
+import struct
+import collections
+import logging
+import threading
+
+from threading import Lock, Condition
 from rpyc.lib import spawn, Timeout, get_methods, get_id_pack
 from rpyc.lib.compat import pickle, next, maxint, select_error, acquire_lock  # noqa: F401
 from rpyc.lib.colls import WeakValueDict, RefCountingColl
@@ -146,7 +150,6 @@ class Connection(object):
         self._HANDLERS = self._request_handlers()
         self._channel = channel
         self._seqcounter = itertools.count()
-        self._recvlock = RLock()
         self._sendlock = Lock()
         self._recv_event = Condition()
         self._request_callbacks = {}
@@ -158,6 +161,14 @@ class Connection(object):
         self._send_queue = []
         self._local_root = root
         self._closed = False
+
+        self._lock = Lock()
+        self._queues = {}
+        self._receiving = False
+        self._events = {}
+
+        self._request_counts = {}
+        self._thread_ids = {}
 
     def __del__(self):
         self.close()
@@ -235,7 +246,12 @@ class Connection(object):
         return next(self._seqcounter)
 
     def _send(self, msg, seq, args):  # IO
-        data = struct.pack("B", msg) + brine.dump((seq, args))
+        logging.debug('send {} {} {}'.format(msg, seq, repr(args)))
+        thread_id = threading.get_ident()
+        if msg == consts.MSG_REQUEST:
+            self._request_counts[thread_id] = self._request_counts.get(thread_id, 0) + 1
+            # logging.debug('+ {} = {}'.format(thread_id, self._request_counts[thread_id]))
+        data = struct.pack('<QQ', self._thread_ids.get(thread_id, 0), thread_id) + brine.dump((msg, seq, args))
         # GC might run while sending data
         # if so, a BaseNetref.__del__ might be called
         # BaseNetref.__del__ must call asyncreq,
@@ -358,26 +374,41 @@ class Connection(object):
             self._config["logger"].debug(debug_msg.format(msg, seq))
 
     def _dispatch(self, data):  # serving---dispatch?
-        msg = data[0] if data else None
+        thread_id = threading.get_ident()
+        msg, seq, args = brine.load(data[8:])
+        logging.debug('dispatch {} {} {}'.format(msg, seq, repr(args)))
         if msg == consts.MSG_REQUEST:
-            self._recvlock.release()
-            seq, args = brine.load(data[1:])
-            self._dispatch_request(seq, args)
+            previous_thread_id = self._thread_ids.get(thread_id)
+            self._thread_ids[thread_id] = struct.unpack('<Q', data[:8])[0]
+            try:
+                self._dispatch_request(seq, args)
+            finally:
+                if previous_thread_id is None:
+                    del self._thread_ids[thread_id]
+                else:
+                    self._thread_ids[thread_id] = previous_thread_id
         elif msg == consts.MSG_REPLY:
-            seq, args = brine.load(data[1:])
             obj = self._unbox(args)
             self._seq_request_callback(msg, seq, False, obj)
-            self._recvlock.release()
+            count = self._request_counts[thread_id]
+            if count == 1:
+                del self._request_counts[thread_id]
+                # logging.debug('- {} = 0'.format(thread_id))
+            else:
+                self._request_counts[thread_id] = count - 1
+                # logging.debug('- {} = {}'.format(thread_id, count - 1))
         elif msg == consts.MSG_EXCEPTION:
-            self._recvlock.release()
-            seq, args = brine.load(data[1:])
             obj = self._unbox_exc(args)
             self._seq_request_callback(msg, seq, True, obj)
+            count = self._request_counts[thread_id]
+            if count == 1:
+                del self._request_counts[thread_id]
+            else:
+                self._request_counts[thread_id] = count - 1
         else:
-            self._recvlock.release()
             raise ValueError(f"invalid message type: {msg!r}")
 
-    def serve(self, timeout=1, wait_for_lock=True, lock_extended=False):  # serving
+    def serve(self, timeout=1, wait_for_lock=True):  # serving
         """Serves a single request or reply that arrives within the given
         time frame (default is 1 sec). Note that the dispatching of a request
         might trigger multiple (nested) requests, thus this function may be
@@ -386,27 +417,130 @@ class Connection(object):
         :returns: ``True`` if a request or reply were received, ``False``
                   otherwise.
         """
+
+        def _get_queue(thread_id):
+            queue = self._queues.get(thread_id)
+            if queue is not None:
+                return queue
+            queue = collections.deque()
+            self._queues[thread_id] = queue
+            return queue
+        
+        def _get_event(thread_id):
+            event = self._events.get(thread_id)
+            if event is not None:
+                return event
+            event = threading.Event()
+            self._events[thread_id] = event
+            return event
+
+        def _pass_receiving():
+            for event in self._events.values():
+                if not event.is_set():
+                    event.set()
+                    break
+            else:
+                self._receiving = False
+
         timeout = Timeout(timeout)
-        with self._recv_event:
-            if not (lock_extended or self._recvlock.acquire(False)):
-                return wait_for_lock and self._recv_event.wait(timeout.timeleft())
-        try:
-            data = self._channel.poll(timeout) and self._channel.recv()
-            if not data:
-                self._recvlock.release()
+        this_thread_id = threading.get_ident()
+
+        with self._lock:
+            try:
+                data = _get_queue(this_thread_id).popleft()
+            except IndexError:
+                data = None
+                if self._receiving:
+                    event = _get_event(this_thread_id)
+                else:
+                    self._receiving = True
+                    event = None
+
+        if data:
+            self._dispatch(data)
+            return True
+
+        if event:
+            if not event.wait(timeout.timeleft()):
+                with self._lock:
+                    if not event.is_set():
+                        del self._events[this_thread_id]
+                        return False
+            with self._lock:
+                del self._events[this_thread_id]
+
+            try:
+                data = self._queues[this_thread_id].popleft()
+            except IndexError:
+                pass
+            else:
+                if data is None:
+                    return False
+                self._dispatch(data)
+                return True
+
+        while True:
+            try:
+                data = self._channel.poll(timeout) and self._channel.recv()
+            except EOFError:
+                self.close()
+                with self._lock:
+                    for thread_id, event in self._events.items():
+                        _get_queue(thread_id).append(None)
+                        event.set()
+                raise
+            # TODO race condition with close, OSError: file descriptor cannot be a negative integer (-1)
+
+            if data:
+                thread_id, = struct.unpack('<Q', data[:8])
+                data = data[8:]
+                if thread_id == 0:
+                    if this_thread_id in self._request_counts:
+                        with self._lock:
+                            for thread_id, event in self._events.items():
+                                if not (thread_id in self._request_counts or event.is_set()):
+                                    _get_queue(thread_id).append(data)
+                                    event.set()
+                                    break
+                            else:
+                                thread_id = None
+                        if thread_id is not None:
+                            continue
+
+                        def _():
+                            try:
+                                while True:
+                                    self.serve(None)
+                                    # if threading.get_ident() not in self._request_counts:  # TODO short lived threads?
+                                    #     break
+                            except (socket.error, select_error, IOError):
+                                if not self.closed:
+                                    raise
+                            except EOFError:
+                                pass
+                            logging.debug('thread exit')
+                        logging.debug('new thread')
+                        thread = threading.Thread(target=_, daemon=True)
+                        thread.start()
+                        thread_id = thread.ident
+                    else:
+                        thread_id = this_thread_id
+
+                if thread_id == this_thread_id:
+                    with self._lock:
+                        _pass_receiving()
+                    self._dispatch(data)
+                    return True
+                else:
+                    with self._lock:
+                        _get_queue(thread_id).append(data)
+                    event = self._events.get(thread_id)
+                    if event is not None:
+                        event.set()
+            else:
+                with self._lock:
+                    _pass_receiving()
                 return False
-        except EOFError:
-            self.close()
-            self._recvlock.release()
-            raise
-        except:
-            self._recvlock.release()
-            raise
-        finally:
-            with self._recv_event:
-                self._recv_event.notify_all()
-        self._dispatch(data)
-        return True
 
     def poll(self, timeout=0):  # serving
         """Serves a single transaction, should one arrives in the given
