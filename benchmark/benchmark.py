@@ -1,7 +1,6 @@
 import numpy
 import rpyc
 import rpyc.utils.factory as ru_factory
-import rpyc.utils.helpers as ru_helpers
 import argparse
 import base64
 import json
@@ -98,7 +97,7 @@ class ServerService(rpyc.Service):
         super().on_connect(connection)
 
         for _ in range(arguments.background):
-            ru_helpers.BgServingThread(connection)
+            threading.Thread(target=connection.serve_all).start()
 
         remote_root = connection.root
         self._remote_sub_1 = remote_root.sub_1
