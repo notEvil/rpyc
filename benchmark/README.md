@@ -38,9 +38,9 @@ Additionally
 
 ## Example
 
-rpyc: 5.3.1
-CPU: Ryzen 5 3600
-OS: Arch 6.2.2-1
+- rpyc: 5.3.1
+- CPU: Ryzen 5 3600
+- OS: Arch 6.2.2-1
 
 ### CPU frequency scaling: schedutil
 
